@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DXExpo Lambda Release Pipeline"
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: "CodeCommit Settings"
+        Parameters:
+          - RepoName
+          - BranchName
+
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - stage
+      - prod
+  RepoName:
+    Type: String
+    Default: nishioka-test
+    Description: CodeCommit repository name.
+  BranchName:
+    Type: String
+    Default: master
+    Description: e.g. master, develop... Default develop branch. If you specify prod in the Enviornment parameter, it will force the master branch to be set.
+
+Resources:
+  #
+  # CodePipelineで使用するS3バケット
+  #
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags:
+        - Key: Env
+          Value: !Ref Env
+    DeletionPolicy: Delete
+
+  #
+  # SAMのDeployで使用するS3バケット
+  #
+  SAMDeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Env
+          Value: !Ref Env
+    DeletionPolicy: Delete
+
+  #
+  # CodePipelineに付与するロール
+  #
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+                - codedeploy.amazonaws.com
+                - cloudformation.amazonaws.com
+                - codepipeline.amazonaws.com
+                - iam.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+              - Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucket}
+                Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+              - Resource: !Sub arn:aws:s3:::${SAMDeployBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:putObject
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                  - codedeploy:*
+                  - cloudformation:*
+                  - iam:PassRole
+      Tags:
+        - Key: Env
+          Value: !Ref Env
+
+  #
+  # SAMのデプロイに付与するロール
+  #
+  SAMDeployServiceRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - lambda:*
+                  - apigateway:*
+                  - dynamodb:*
+                  - iam:*
+              - Resource: !Sub arn:aws:s3:::${SAMDeployBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+      Tags:
+        - Key: Env
+          Value: !Ref Env
+
+  #
+  # CodeBuildの定義
+  # 必要であれば実行インスタンスを変更する
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DeletionPolicy: Delete
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref SAMDeployBucket
+      ServiceRole: !Ref CodePipelineServiceRole
+      Tags:
+        - Key: Env
+          Value: !Ref Env
+
+  #
+  # CodePipelineの定義
+  #
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DeletionPolicy: Delete
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt SAMDeployServiceRole.Arn
+                StackName: !Sub ${AWS::StackName}-${Env}-sam
+                TemplatePath: "BuildArtifact::template-output.yaml"
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+      Tags:
+        - Key: Env
+          Value: !Ref Env
